@@ -44,7 +44,6 @@ export default function Live() {
   const [finished, setFinished] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
   const [camOn, setCamOn] = useState(false);
-  const [noSpeechApi, setNoSpeechApi] = useState(false);
 
   const ws = useRef<WebSocket | null>(null);
   const stream = useRef<MediaStream | null>(null);
@@ -59,6 +58,8 @@ export default function Live() {
   const finalRef = useRef('');  // the answer box text: speech finals plus anything typed
   const typed = useRef(false);
   const interimRef = useRef('');
+  // Brave ships webkitSpeechRecognition but blocks Google's service; there the server transcribes with Whisper.
+  const serverStt = useRef(!!(navigator as any).brave);
   const qRef = useRef<Question | null>(null);
   const levelRef = useRef(0);
   const speechInChunk = useRef(false);
@@ -130,7 +131,8 @@ export default function Live() {
 
     // Browser speech recognition: finals are sent once each, so the server transcript never repeats.
     const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (SR) {
+    if (!SR) serverStt.current = true;
+    if (SR && !serverStt.current) {
       const r = new SR();
       r.continuous = true;
       r.interimResults = true;
@@ -153,16 +155,16 @@ export default function Live() {
         setInterim(interimRef.current);
       };
       r.onerror = (e: any) => {
-        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') setNoSpeechApi(true);
-        // network: Brave/Chromium/offline can't reach Google's recogniser; audio-capture: no mic for it
-        else if (e.error === 'network' || e.error === 'audio-capture')
-          flash('Live transcript unavailable', 'This browser can\'t transcribe speech here. Use Google Chrome, or type your answer in the box.', 8000);
+        // Brave/Chromium can't reach Google's recogniser (network) or block it: use the server's Whisper transcript
+        if (['network', 'audio-capture', 'not-allowed', 'service-not-allowed'].includes(e.error)) {
+          serverStt.current = true;
+          if (recog.current === r) recog.current = null;
+          try { r.abort(); } catch {}
+        }
       };
       // Chrome stops recognition after a pause; restart only this recognizer while still answering.
       r.onend = () => { if (recording.current && recog.current === r) { try { r.start(); } catch {} } };
       try { r.start(); recog.current = r; } catch {}
-    } else {
-      setNoSpeechApi(true);
     }
 
     // Raw audio for delivery scoring, flagged with whether the mic heard speech in that slice.
@@ -181,7 +183,7 @@ export default function Live() {
           let bin = '';
           for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
           chunkId.current += 1;
-          send({ type: 'audio_chunk', chunk_id: chunkId.current, data: btoa(bin), format: 'webm', level_db: n ? Math.round((sum / n) * 10) / 10 : undefined, duration: 0.5, is_speech: isSpeech });
+          send({ type: 'audio_chunk', chunk_id: chunkId.current, data: btoa(bin), format: 'webm', server_transcript: serverStt.current, level_db: n ? Math.round((sum / n) * 10) / 10 : undefined, duration: 0.5, is_speech: isSpeech });
         };
         rec.start(500);
         recorder.current = rec;
@@ -316,6 +318,13 @@ export default function Live() {
             }
             break;
           }
+          case 'transcript_partial':
+            // Whisper's text so far (browsers without live recognition); never overwrite what was typed
+            if (recording.current && !typed.current && m.text) {
+              finalRef.current = m.text;
+              setDraft(m.text);
+            }
+            break;
           case 'retry_answer':
             // Ava heard speech but got no words: stop, ask again, and listen afresh when she finishes.
             stopAnswer();
@@ -462,7 +471,6 @@ export default function Live() {
       </header>
       {banner ? <div className="banner"><b>{banner.t}</b><span>{banner.m}</span></div> : null}
       {conn === 'lost' && !banner ? <div className="banner"><b>Reconnecting</b><span>Lost the connection to the server. Retrying…</span></div> : null}
-      {noSpeechApi ? <div className="banner"><b>No live transcript</b><span>This browser doesn't support speech recognition. Use Google Chrome so Ava can read your answers.</span></div> : null}
 
       <div className="cols">
         <aside>

@@ -107,6 +107,10 @@ class SessionOrchestrator:
         self._ack_task: Optional[asyncio.Task] = None
         # Raw audio of the answer in progress (one browser MediaRecorder stream), transcribed when it ends.
         self._answer_audio = bytearray()
+        # Live transcript for browsers without speech recognition (Brave): Whisper on the audio so far
+        self._partial_task: Optional[asyncio.Task] = None
+        self._partial_at = 0.0
+        self._answer_gen = 0  # bumped per answer, so a late partial never lands on the next one
         self.storage_manager = storage_manager or default_storage_manager
         self.signal_processor = signal_processor or default_signal_processor
         self.integrity_monitor = IntegrityMonitor(
@@ -906,6 +910,37 @@ class SessionOrchestrator:
         logger.info("Session #%d: Whisper transcribed %d bytes -> %d words", self.session_id, len(audio), len(res.get("text", "").split()))
         return res
 
+    PARTIAL_INTERVAL = 4.0  # Groq's free Whisper tier allows ~20 requests a minute
+
+    def _maybe_partial_transcript(self, now: float) -> None:
+        """Starts a Whisper pass over the answer audio so far, at most every PARTIAL_INTERVAL seconds."""
+        if (not self.hosted_stt.is_hosted or self.state.state != SessionState.LISTENING
+                or not self.state.current_question_speech_detected
+                or (self._partial_task and not self._partial_task.done())
+                or now - self._partial_at < self.PARTIAL_INTERVAL):
+            return
+        self._partial_at = now
+        self._partial_task = asyncio.create_task(self._partial_transcript(bytes(self._answer_audio), self._answer_gen))
+
+    async def _partial_transcript(self, audio: bytes, gen: int) -> None:
+        prompt = (self.state.current_question or {}).get("text", "")[:200] or None
+        try:
+            res = await asyncio.wait_for(
+                self.hosted_stt.transcribe_audio_bytes(audio, filename="answer.webm", language="en", prompt=prompt),
+                timeout=8.0,
+            )
+        except Exception as e:
+            logger.info("Session #%d: partial STT failed (%s)", self.session_id, e)
+            return
+        text = (res.get("text") or "").strip()
+        if res.get("provider") == "mock" or not any(ch.isalnum() for ch in text):
+            return
+        if gen != self._answer_gen or self.state.state != SessionState.LISTENING:
+            return
+        # Also the fallback if the final pass fails
+        self.state.current_answer_text = text
+        await self.emit("transcript_partial", {"text": text})
+
     async def _finish_answer(self, reason: str = "manual", answer_text: Optional[str] = None, typed: bool = False) -> None:
         """
         Finalizes candidate's answer for the current question:
@@ -926,6 +961,7 @@ class SessionOrchestrator:
 
         # Server-side Whisper on the recorded answer; the browser transcript is the fallback.
         # A typed (or edited) answer is exactly what the candidate meant, so it is never replaced.
+        self._answer_gen += 1
         whisper = None if typed and final_text else await self._transcribe_answer_audio()
         self._answer_audio = bytearray()
         # Whisper invents text ("Thank you.") on silence, so it only counts when speech was actually heard
@@ -1105,6 +1141,9 @@ class SessionOrchestrator:
             if is_speech:
                 self.state.current_question_speech_detected = True
 
+            if data.get("server_transcript") and raw_audio:
+                self._maybe_partial_transcript(now)
+
             # Streaming STT & word-level timestamps
             timed_res = None
             if text_fragment:
@@ -1200,6 +1239,7 @@ class SessionOrchestrator:
             self.state.current_question_speech_detected = False
             self.voice_tracker.reset()
             self._answer_audio = bytearray()
+            self._answer_gen += 1
             if self.state.current_question:
                 self.stt_service.reset_question(self.state.current_question.get("id", 1))
             self._persist()
