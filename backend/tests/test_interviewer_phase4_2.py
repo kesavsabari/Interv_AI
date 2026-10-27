@@ -269,14 +269,20 @@ class TestInterviewerPhase4_2(unittest.TestCase):
 
             # 5. Server evaluates, routes to ASKING, selects next question following blueprint
             # Server emits: question (main technical question)
-            f_next_q = ws.receive_json()
+            # The spoken "Mm-hm." ack runs in parallel with evaluation, so it can arrive anywhere here
+            def next_frame():
+                f = ws.receive_json()
+                while f["type"] == "ack":
+                    f = ws.receive_json()
+                return f
+            f_next_q = next_frame()
             self.assertEqual(f_next_q["type"], "question")
             # Must not be warmup or tell me about yourself
             self.assertNotEqual(f_next_q["topic"], "Warmup")
             self.assertNotIn("Tell me about yourself", f_next_q["text"])
 
             # Server emits: avatar_speak for next question with audio_url and subtitles
-            f_next_speak = ws.receive_json()
+            f_next_speak = next_frame()
             self.assertEqual(f_next_speak["type"], "avatar_speak")
             self.assertEqual(f_next_speak["text"], f_next_q["text"])
             self.assertTrue(f_next_speak["audio_url"].startswith("/session/tts/audio/"))

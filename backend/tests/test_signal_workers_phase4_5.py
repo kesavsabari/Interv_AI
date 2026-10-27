@@ -111,7 +111,10 @@ class TestSignalWorkersPhase4(unittest.TestCase):
         }
 
         # Create a synthetic test JPEG frame (64x64 solid image)
-        import cv2
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("opencv not installed")
         dummy_img = np.full((120, 120, 3), 180, dtype=np.uint8)
         _, enc = cv2.imencode(".jpg", dummy_img)
         frame_b64 = "data:image/jpeg;base64," + base64.b64encode(enc.tobytes()).decode()
